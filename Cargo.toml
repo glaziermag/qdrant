@@ -357,6 +357,9 @@ members = [
     "lib/storage",
     "lib/trififo",
 ]
+exclude = [
+    "lib/edge/publish/qdrant-edge",
+]
 
 [profile.release]
 lto = "fat"
