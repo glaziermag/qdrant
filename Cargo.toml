@@ -358,6 +358,7 @@ members = [
     "lib/trififo",
 ]
 exclude = [
+    "lib/edge/publish/examples",
     "lib/edge/publish/qdrant-edge",
 ]
 
