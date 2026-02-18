@@ -43,3 +43,12 @@ jobs:
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Check cargo clippy warnings for all targets and features
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+    - name: Create elge amalgamation
+      run: lib/edge/publish/amalgamate.py
+    - name: Check edge examples
+      run: |
+        cd lib/edge/publish/examples
+        echo CARGO_TARGET_DIR=$CARGO_TARGET_DIR
+        cargo check
+
