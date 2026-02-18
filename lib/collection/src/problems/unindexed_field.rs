@@ -242,6 +242,9 @@ fn infer_index_from_field_condition(field_condition: &FieldCondition) -> Vec<Fie
             RangeInterface::DateTime(_) => {
                 required_indexes.push(FieldIndexType::DatetimeRange);
             }
+            RangeInterface::Integer(_) => {
+                required_indexes.push(FieldIndexType::IntRange);
+            }
             RangeInterface::Float(_) => {
                 required_indexes.push(FieldIndexType::FloatRange);
                 required_indexes.push(FieldIndexType::IntRange);

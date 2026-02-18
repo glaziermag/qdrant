@@ -1799,6 +1799,9 @@ impl From<segment::types::FieldCondition> for FieldCondition {
         } = value;
 
         let (range, datetime_range) = match range {
+            Some(segment::types::RangeInterface::Integer(range)) => {
+                (Some(Range::from(range.map(|v| ordered_float::OrderedFloat(v as f64)))), None)
+            }
             Some(segment::types::RangeInterface::Float(range)) => (Some(Range::from(range)), None),
             Some(segment::types::RangeInterface::DateTime(range)) => (None, Some(range.into())),
             None => (None, None),

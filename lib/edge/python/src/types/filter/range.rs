@@ -26,6 +26,9 @@ impl Repr for PyRange {
 impl From<RangeInterface> for PyRange {
     fn from(range: RangeInterface) -> Self {
         match range {
+            RangeInterface::Integer(integer) => {
+                PyRange::Float(PyRangeFloat(integer.map(|v| OrderedFloat(v as f64))))
+            }
             RangeInterface::Float(float) => PyRange::Float(PyRangeFloat(float)),
             RangeInterface::DateTime(date_time) => PyRange::DateTime(PyRangeDateTime(date_time)),
         }

@@ -335,6 +335,9 @@ pub fn get_range_checkers(
     hw_acc: HwMeasurementAcc,
 ) -> Option<ConditionCheckerFn<'_>> {
     match range {
+        RangeInterface::Integer(range) => {
+            get_float_range_checkers(index, range.map(|v| OrderedFloat(v as f64)), hw_acc)
+        }
         RangeInterface::Float(range) => get_float_range_checkers(index, range, hw_acc),
         RangeInterface::DateTime(range) => get_datetime_range_checkers(index, range, hw_acc),
     }
