@@ -115,3 +115,38 @@ impl BatchResultAggregator {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use segment::types::ExtendedPointId;
+
+    use super::*;
+
+    fn scored_point(id: u64, score: ScoreType) -> ScoredPoint {
+        ScoredPoint {
+            id: ExtendedPointId::NumId(id),
+            version: 1,
+            score,
+            payload: None,
+            vector: None,
+            shard_key: None,
+            order_value: None,
+        }
+    }
+
+    #[test]
+    fn zero_limit_search_aggregator_does_not_panic() {
+        let mut aggregator = SearchResultAggregator::new(0);
+        aggregator.push(scored_point(1, 0.1));
+        assert!(aggregator.into_vec().is_empty());
+    }
+
+    #[test]
+    fn zero_limit_batch_aggregator_does_not_panic() {
+        let mut batch = BatchResultAggregator::new([0]);
+        let points = vec![scored_point(1, 0.5), scored_point(2, 0.1)];
+        batch.update_point_versions(&points);
+        batch.update_batch_results(0, points);
+        assert_eq!(batch.into_topk(), vec![Vec::new()]);
+    }
+}
