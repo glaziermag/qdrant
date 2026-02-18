@@ -827,6 +827,7 @@ impl MetricsProvider for HardwareTelemetry {
 #[derive(Default)]
 struct OperationDurationMetricsBuilder {
     total: Vec<Metric>,
+    fail_total: Vec<Metric>,
     avg_secs: Vec<Metric>,
     min_secs: Vec<Metric>,
     max_secs: Vec<Metric>,
@@ -843,6 +844,8 @@ impl OperationDurationMetricsBuilder {
         add_timings: bool,
     ) {
         self.total.push(counter(stat.count as f64, labels));
+        self.fail_total
+            .push(counter(stat.fail_count.unwrap_or_default() as f64, labels));
 
         if !add_timings {
             return;
@@ -876,6 +879,7 @@ impl OperationDurationMetricsBuilder {
     pub fn build(self, global_prefix: Option<&str>, prefix: &str, metrics: &mut MetricsData) {
         let OperationDurationMetricsBuilder {
             total,
+            fail_total,
             avg_secs,
             min_secs,
             max_secs,
@@ -889,6 +893,13 @@ impl OperationDurationMetricsBuilder {
             "total number of responses",
             MetricType::COUNTER,
             total,
+            Some(&prefix),
+        ));
+        metrics.push_metric(metric_family(
+            "responses_fail_total",
+            "total number of failed responses",
+            MetricType::COUNTER,
+            fail_total,
             Some(&prefix),
         ));
         metrics.push_metric(metric_family(
@@ -1279,6 +1290,10 @@ mod procfs_metrics {
 
 #[cfg(test)]
 mod tests {
+    use segment::common::operation_time_statistics::OperationDurationStatistics;
+
+    use super::{MetricsData, OperationDurationMetricsBuilder};
+
     #[test]
     fn test_endpoint_whitelists_sorted() {
         use super::{GRPC_ENDPOINT_WHITELIST, REST_ENDPOINT_WHITELIST};
@@ -1290,6 +1305,38 @@ mod tests {
         assert!(
             GRPC_ENDPOINT_WHITELIST.windows(2).all(|n| n[0] <= n[1]),
             "GRPC_ENDPOINT_WHITELIST must be sorted in code to allow binary search"
+        );
+    }
+
+    #[test]
+    fn test_operation_duration_builder_emits_fail_total() {
+        let mut builder = OperationDurationMetricsBuilder::default();
+        let mut metrics = MetricsData::empty();
+        let stats = OperationDurationStatistics {
+            count: 3,
+            fail_count: Some(2),
+            avg_duration_micros: None,
+            min_duration_micros: None,
+            max_duration_micros: None,
+            total_duration_micros: None,
+            last_responded: None,
+            duration_micros_histogram: vec![],
+        };
+
+        builder.add(
+            &stats,
+            &[("method", "POST"), ("endpoint", "/collections/{name}/points/query")],
+            false,
+        );
+        builder.build(None, "rest", &mut metrics);
+
+        let rendered = metrics.format_metrics();
+        assert!(rendered.contains("rest_responses_fail_total"));
+        assert!(
+            rendered.contains(
+                "rest_responses_fail_total{method=\"POST\",endpoint=\"/collections/{name}/points/query\"} 2"
+            ),
+            "expected fail counter to include fail_count from telemetry, got:\n{rendered}"
         );
     }
 }
