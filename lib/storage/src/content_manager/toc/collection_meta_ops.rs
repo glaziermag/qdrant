@@ -570,8 +570,6 @@ impl TableOfContent {
                     &collection.state().await.transfers,
                 )?;
 
-                let collection = self.get_collection_unchecked(&collection_id).await?;
-
                 let current_state = collection
                     .state()
                     .await
