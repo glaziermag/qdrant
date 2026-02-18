@@ -225,9 +225,9 @@ impl Device {
             vk_physical_device.vk_physical_device,
             &extensions_cstr,
         )?;
-        let extension_names_raw: Vec<*const i8> = extensions_cstr
+        let extension_names_raw: Vec<*const std::ffi::c_char> = extensions_cstr
             .iter()
-            .map(|raw_name| raw_name.as_ptr())
+            .map(|raw_name| raw_name.as_ptr() as *const std::ffi::c_char)
             .collect();
 
         let device_create_info = vk::DeviceCreateInfo::default()
