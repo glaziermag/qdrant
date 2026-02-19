@@ -19,6 +19,8 @@ use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::rate_limiting::RateLimiter;
 use common::save_on_disk::SaveOnDisk;
+#[cfg(test)]
+use futures::future::BoxFuture;
 use replica_set_state::{ReplicaSetState, ReplicaState};
 use segment::types::{ExtendedPointId, Filter, SeqNumberType, ShardKey};
 use serde::{Deserialize, Serialize};
@@ -86,6 +88,19 @@ use crate::shards::shard_config::ShardConfig;
 //    └─────────────────────────────────────────┘
 //
 
+#[cfg(test)]
+pub(crate) type OrderedWriteRemoteUpdateHook = Arc<
+    dyn Fn(
+            PeerId,
+            OperationWithClockTag,
+            bool,
+            Option<Duration>,
+            HwMeasurementAcc,
+        ) -> BoxFuture<'static, CollectionResult<UpdateResult>>
+        + Send
+        + Sync,
+>;
+
 /// A set of shard replicas.
 ///
 /// Handles operations so that the state is consistent across all the replicas of the shard.
@@ -119,6 +134,8 @@ pub struct ShardReplicaSet {
     write_ordering_lock: Mutex<()>,
     /// Local clock set, used to tag new operations on this shard.
     clock_set: Mutex<ClockSet>,
+    #[cfg(test)]
+    ordered_write_remote_update_hook: parking_lot::RwLock<Option<OrderedWriteRemoteUpdateHook>>,
     write_rate_limiter: Option<parking_lot::Mutex<RateLimiter>>,
     pub partial_snapshot_meta: PartialSnapshotMeta,
 }
@@ -229,6 +246,8 @@ impl ShardReplicaSet {
             optimizer_resource_budget,
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
+            #[cfg(test)]
+            ordered_write_remote_update_hook: parking_lot::RwLock::new(None),
             write_rate_limiter,
             partial_snapshot_meta: PartialSnapshotMeta::default(),
         })
@@ -371,6 +390,8 @@ impl ShardReplicaSet {
             optimizer_resource_budget,
             write_ordering_lock: Mutex::new(()),
             clock_set: Default::default(),
+            #[cfg(test)]
+            ordered_write_remote_update_hook: parking_lot::RwLock::new(None),
             write_rate_limiter,
             partial_snapshot_meta: PartialSnapshotMeta::default(),
         };

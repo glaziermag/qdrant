@@ -27,6 +27,14 @@ const UPDATE_MAX_CLOCK_REJECTED_RETRIES: usize = 3;
 const DEFAULT_SHARD_DEACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl ShardReplicaSet {
+    #[cfg(test)]
+    fn set_ordered_write_remote_update_hook(
+        &self,
+        hook: Option<super::OrderedWriteRemoteUpdateHook>,
+    ) {
+        *self.ordered_write_remote_update_hook.write() = hook;
+    }
+
     /// Update local shard if any without forwarding to remote shards
     ///
     /// If `force` is true, the operation will be applied unconditionally no matter the replica
@@ -160,20 +168,16 @@ impl ShardReplicaSet {
 
         // If we are the leader, run the update from this replica set
         if leader_peer == self.this_peer_id() {
-            // Lock updates if ordering is strong or medium
-            let _write_ordering_lock = match ordering {
-                WriteOrdering::Strong | WriteOrdering::Medium => {
-                    Some(self.write_ordering_lock.lock().await)
-                }
-                WriteOrdering::Weak => None,
-            };
-
             self.update(
                 operation,
                 wait,
                 timeout,
                 update_only_existing,
                 hw_measurement_acc,
+                match ordering {
+                    WriteOrdering::Strong | WriteOrdering::Medium => Some(&self.write_ordering_lock),
+                    WriteOrdering::Weak => None,
+                },
             )
             .await
         } else {
@@ -242,6 +246,7 @@ impl ShardReplicaSet {
         timeout: Option<Duration>,
         update_only_existing: bool,
         hw_measurement_acc: HwMeasurementAcc,
+        write_ordering_lock: Option<&tokio::sync::Mutex<()>>,
     ) -> CollectionResult<UpdateResult> {
         // `ShardRepilcaSet::update_impl` is not cancel safe, so this method is not cancel safe.
 
@@ -272,6 +277,7 @@ impl ShardReplicaSet {
                     &mut clock,
                     update_only_existing,
                     hw_measurement_acc.clone(),
+                    write_ordering_lock,
                 )
                 .await?;
 
@@ -314,6 +320,7 @@ impl ShardReplicaSet {
         clock: &mut clock_set::ClockGuard,
         update_only_existing: bool,
         hw_measurement_acc: HwMeasurementAcc,
+        write_ordering_lock: Option<&tokio::sync::Mutex<()>>,
     ) -> CollectionResult<Option<UpdateResult>> {
         // `LocalShard::update` is not guaranteed to be cancel safe and it's impossible to cancel
         // multiple parallel updates in a way that is *guaranteed* not to introduce inconsistencies
@@ -331,6 +338,9 @@ impl ShardReplicaSet {
             .filter(|rs| self.is_peer_updatable(rs.peer_id))
             .collect();
 
+        #[cfg(test)]
+        let ordered_write_remote_update_hook = self.ordered_write_remote_update_hook.read().clone();
+
         // Local is defined and can receive updates
         let local_is_updatable = local.is_some() && self.is_peer_updatable(this_peer_id);
 
@@ -341,9 +351,15 @@ impl ShardReplicaSet {
             )));
         }
 
+        // Keep the ordering lock scope as small as possible: only serialize tick assignment/tagging.
+        let write_ordering_guard = match write_ordering_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let current_clock_tick = clock.tick_once();
         let clock_tag = ClockTag::new(this_peer_id, clock.id() as _, current_clock_tick);
         let operation = OperationWithClockTag::new(operation, Some(clock_tag));
+        drop(write_ordering_guard);
 
         let mut update_futures = Vec::with_capacity(updatable_remote_shards.len() + 1);
 
@@ -381,7 +397,23 @@ impl ShardReplicaSet {
             let operation = operation.clone();
 
             let hw_acc = hw_measurement_acc.clone();
+            #[cfg(test)]
+            let ordered_write_remote_update_hook = ordered_write_remote_update_hook.clone();
             let remote_update = async move {
+                #[cfg(test)]
+                if let Some(test_remote_update_hook) = ordered_write_remote_update_hook {
+                    return test_remote_update_hook(
+                        remote.peer_id,
+                        operation,
+                        wait,
+                        timeout,
+                        hw_acc,
+                    )
+                    .await
+                    .map(|ok| (remote.peer_id, ok))
+                    .map_err(|err| (remote.peer_id, err));
+                }
+
                 remote
                     .update(operation, wait, timeout, hw_acc)
                     .await
@@ -789,20 +821,26 @@ mod tests {
     use std::collections::HashSet;
     use std::num::NonZeroU32;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use common::budget::ResourceBudget;
+    use common::counter::hardware_accumulator::HwMeasurementAcc;
     use common::save_on_disk::SaveOnDisk;
     use segment::types::Distance;
     use tempfile::{Builder, TempDir};
     use tokio::runtime::Handle;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
     use super::*;
     use crate::config::*;
     use crate::operations::types::VectorsConfig;
     use crate::operations::vector_params_builder::VectorParamsBuilder;
     use crate::optimizers_builder::OptimizersConfig;
-    use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
+    use crate::shards::replica_set::{
+        AbortShardTransfer, ChangePeerFromState, OrderedWriteRemoteUpdateHook,
+    };
+    use crate::tests::fixtures::delete_point_operation;
 
     #[test]
     fn test_merge_successful_update_results_wait_timeout_dominates() {
@@ -890,6 +928,423 @@ mod tests {
         assert_eq!(rs.highest_alive_replica_peer_id(), Some(4));
     }
 
+    #[tokio::test]
+    async fn test_strong_writes_do_not_serialize_across_remote_await_barrier() {
+        let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
+
+        let replica_set = Arc::new(
+            new_shard_replica_set_with(
+                &collection_dir,
+                2,
+                true,
+                HashSet::from([1]),
+                NonZeroU32::new(1).unwrap(),
+            )
+            .await,
+        );
+
+        replica_set
+            .set_replica_state(2, ReplicaState::Recovery)
+            .await
+            .unwrap();
+        replica_set
+            .set_replica_state(1, ReplicaState::Active)
+            .await
+            .unwrap();
+
+        const N: usize = 8;
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let hook: OrderedWriteRemoteUpdateHook = {
+            let barrier = barrier.clone();
+            let started = started.clone();
+            Arc::new(
+                move |_peer_id, operation, _wait, _timeout, _hw_measurement| {
+                    let barrier = barrier.clone();
+                    let started = started.clone();
+                    Box::pin(async move {
+                        let tag = operation
+                            .clock_tag
+                            .expect("ordered write operation must have a tag");
+
+                        started.fetch_add(1, AtomicOrdering::SeqCst);
+                        barrier.wait().await;
+
+                        Ok(UpdateResult {
+                            operation_id: Some(tag.clock_tick),
+                            status: UpdateStatus::Completed,
+                            clock_tag: Some(tag),
+                        })
+                    })
+                },
+            )
+        };
+        replica_set.set_ordered_write_remote_update_hook(Some(hook));
+
+        let mut tasks = Vec::with_capacity(N);
+        for i in 0..N {
+            let rs = replica_set.clone();
+            tasks.push(tokio::spawn(async move {
+                rs.update_with_consistency(
+                    delete_point_operation(i as u64),
+                    true,
+                    None,
+                    WriteOrdering::Strong,
+                    false,
+                    HwMeasurementAcc::new(),
+                )
+                .await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for t in tasks {
+                t.await.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("writes must not be serialized by write_ordering_lock across remote await");
+
+        replica_set.set_ordered_write_remote_update_hook(None);
+
+        assert_eq!(
+            started.load(AtomicOrdering::SeqCst),
+            N,
+            "all {N} writes should have reached the remote await point"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_ordering_lock_not_held_while_remote_update_is_blocked() {
+        let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
+
+        let replica_set = Arc::new(
+            new_shard_replica_set_with(
+                &collection_dir,
+                2,
+                true,
+                HashSet::from([1]),
+                NonZeroU32::new(1).unwrap(),
+            )
+            .await,
+        );
+
+        replica_set
+            .set_replica_state(2, ReplicaState::Recovery)
+            .await
+            .unwrap();
+        replica_set
+            .set_replica_state(1, ReplicaState::Active)
+            .await
+            .unwrap();
+
+        let (remote_started_tx, mut remote_started_rx) = mpsc::unbounded_channel::<u64>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+        let hook: OrderedWriteRemoteUpdateHook = {
+            let release_rx = release_rx.clone();
+            Arc::new(
+                move |_peer_id, operation, _wait, _timeout, _hw_measurement| {
+                    let release_rx = release_rx.clone();
+                    let remote_started_tx = remote_started_tx.clone();
+                    Box::pin(async move {
+                        let tag = operation
+                            .clock_tag
+                            .expect("ordered write operation must have a tag");
+                        remote_started_tx
+                            .send(tag.clock_tick)
+                            .expect("must record remote start");
+
+                        let rx = release_rx
+                            .lock()
+                            .await
+                            .take()
+                            .expect("release channel must be available");
+                        let _ = rx.await;
+
+                        Ok(UpdateResult {
+                            operation_id: Some(tag.clock_tick),
+                            status: UpdateStatus::Completed,
+                            clock_tag: Some(tag),
+                        })
+                    })
+                },
+            )
+        };
+
+        replica_set.set_ordered_write_remote_update_hook(Some(hook));
+
+        let rs_task = replica_set.clone();
+        let task = tokio::spawn(async move {
+            rs_task
+                .update_with_consistency(
+                    delete_point_operation(123),
+                    true,
+                    None,
+                    WriteOrdering::Strong,
+                    false,
+                    HwMeasurementAcc::new(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), remote_started_rx.recv())
+            .await
+            .expect("remote must start")
+            .expect("channel must yield tick");
+
+        let lock_guard = tokio::time::timeout(
+            Duration::from_millis(200),
+            replica_set.write_ordering_lock.lock(),
+        )
+        .await
+        .expect("write_ordering_lock should be free while remote update is awaiting");
+        drop(lock_guard);
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+
+        replica_set.set_ordered_write_remote_update_hook(None);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual perf smoke test; run locally to compare before/after #8094"]
+    async fn perf_smoke_8094_ordered_writes_overlap_remote_rtt() {
+        let n: usize = std::env::var("N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let delay_ms: u64 = std::env::var("DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+
+        let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
+        let replica_set = Arc::new(
+            new_shard_replica_set_with(
+                &collection_dir,
+                2,
+                true,
+                HashSet::from([1]),
+                NonZeroU32::new(1).unwrap(),
+            )
+            .await,
+        );
+        replica_set
+            .set_replica_state(2, ReplicaState::Recovery)
+            .await
+            .unwrap();
+        replica_set
+            .set_replica_state(1, ReplicaState::Active)
+            .await
+            .unwrap();
+
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(n + 1));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let hook: OrderedWriteRemoteUpdateHook = {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            Arc::new(
+                move |_peer_id, operation, _wait, _timeout, _hw_measurement| {
+                    let in_flight = in_flight.clone();
+                    let max_in_flight = max_in_flight.clone();
+                    Box::pin(async move {
+                        let cur = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        max_in_flight.fetch_max(cur, AtomicOrdering::SeqCst);
+
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                        in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+
+                        let tag = operation
+                            .clock_tag
+                            .expect("ordered write operation must have a tag");
+                        Ok(UpdateResult {
+                            operation_id: Some(tag.clock_tick),
+                            status: UpdateStatus::Completed,
+                            clock_tag: Some(tag),
+                        })
+                    })
+                },
+            )
+        };
+        replica_set.set_ordered_write_remote_update_hook(Some(hook));
+
+        let mut tasks = Vec::with_capacity(n);
+        for i in 0..n {
+            let rs = replica_set.clone();
+            let b = start_barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                b.wait().await;
+                rs.update_with_consistency(
+                    delete_point_operation(i as u64),
+                    true,
+                    None,
+                    WriteOrdering::Strong,
+                    false,
+                    HwMeasurementAcc::new(),
+                )
+                .await
+                .expect("ordered write should succeed");
+            }));
+        }
+
+        let started = Instant::now();
+        start_barrier.wait().await;
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let elapsed = started.elapsed();
+
+        replica_set.set_ordered_write_remote_update_hook(None);
+
+        let max = max_in_flight.load(AtomicOrdering::SeqCst);
+        eprintln!(
+            "[perf_smoke_8094] N={n}, DELAY_MS={delay_ms}, elapsed={elapsed:?}, max_in_flight_remote={max}, approx_ops_per_sec={:.1}",
+            (n as f64) / elapsed.as_secs_f64()
+        );
+
+        assert!(
+            max > 1,
+            "expected >1 in-flight remote updates; got {max}. If this is on a very constrained runtime, try smaller N or larger DELAY_MS."
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "nondeterministic stress test; run locally to shake out regressions around #8094"]
+    async fn chaos_8094_random_remote_jitter_many_concurrent_ordered_writes() {
+        let n: usize = std::env::var("N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let max_delay_ms: u64 = std::env::var("MAX_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        let overall_timeout_s: u64 = std::env::var("TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let seed: u64 = std::env::var("SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64
+            });
+
+        eprintln!("[chaos_8094] seed={seed} N={n} MAX_DELAY_MS={max_delay_ms} TIMEOUT_S={overall_timeout_s}");
+
+        let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
+        let replica_set = Arc::new(
+            new_shard_replica_set_with(
+                &collection_dir,
+                2,
+                true,
+                HashSet::from([1]),
+                NonZeroU32::new(1).unwrap(),
+            )
+            .await,
+        );
+        replica_set
+            .set_replica_state(2, ReplicaState::Recovery)
+            .await
+            .unwrap();
+        replica_set
+            .set_replica_state(1, ReplicaState::Active)
+            .await
+            .unwrap();
+
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(n + 1));
+        let seq = Arc::new(AtomicU64::new(seed));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let hook: OrderedWriteRemoteUpdateHook = {
+            let seq = seq.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            Arc::new(
+                move |_peer_id, operation, _wait, _timeout, _hw_measurement| {
+                    let seq = seq.clone();
+                    let in_flight = in_flight.clone();
+                    let max_in_flight = max_in_flight.clone();
+                    Box::pin(async move {
+                        let cur = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        max_in_flight.fetch_max(cur, AtomicOrdering::SeqCst);
+
+                        let s = seq.fetch_add(0x9E3779B97F4A7C15, AtomicOrdering::SeqCst);
+                        let jitter = (s ^ (s >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+                        let delay = jitter % max_delay_ms.max(1);
+
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+
+                        in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+
+                        let tag = operation
+                            .clock_tag
+                            .expect("ordered write operation must have a tag");
+                        Ok(UpdateResult {
+                            operation_id: Some(tag.clock_tick),
+                            status: UpdateStatus::Completed,
+                            clock_tag: Some(tag),
+                        })
+                    })
+                },
+            )
+        };
+        replica_set.set_ordered_write_remote_update_hook(Some(hook));
+
+        let mut tasks = Vec::with_capacity(n);
+        for i in 0..n {
+            let rs = replica_set.clone();
+            let b = start_barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                b.wait().await;
+                rs.update_with_consistency(
+                    delete_point_operation(i as u64),
+                    true,
+                    None,
+                    WriteOrdering::Strong,
+                    false,
+                    HwMeasurementAcc::new(),
+                )
+                .await
+            }));
+        }
+
+        let started = Instant::now();
+        start_barrier.wait().await;
+
+        let res = tokio::time::timeout(Duration::from_secs(overall_timeout_s), async {
+            for t in tasks {
+                t.await.unwrap().expect("ordered write should succeed");
+            }
+        })
+        .await;
+
+        let elapsed = started.elapsed();
+        replica_set.set_ordered_write_remote_update_hook(None);
+
+        let max = max_in_flight.load(AtomicOrdering::SeqCst);
+        eprintln!(
+            "[chaos_8094] elapsed={elapsed:?} max_in_flight_remote={max} approx_ops_per_sec={:.1}",
+            (n as f64) / elapsed.as_secs_f64()
+        );
+
+        res.expect(
+            "chaos run timed out (possible regression to serialized remote awaits / deadlock)"
+        );
+    }
+
     const TEST_OPTIMIZERS_CONFIG: OptimizersConfig = OptimizersConfig {
         deleted_threshold: 0.9,
         vacuum_min_vector_number: 1000,
@@ -904,6 +1359,23 @@ mod tests {
     };
 
     async fn new_shard_replica_set(collection_dir: &TempDir) -> ShardReplicaSet {
+        new_shard_replica_set_with(
+            collection_dir,
+            1,
+            false,
+            HashSet::from([2, 3, 4, 5]),
+            NonZeroU32::new(2).unwrap(),
+        )
+        .await
+    }
+
+    async fn new_shard_replica_set_with(
+        collection_dir: &TempDir,
+        this_peer_id: PeerId,
+        local: bool,
+        remotes: HashSet<PeerId>,
+        write_consistency_factor: NonZeroU32,
+    ) -> ShardReplicaSet {
         let update_runtime = Handle::current();
         let search_runtime = Handle::current();
 
@@ -917,7 +1389,7 @@ mod tests {
             vectors: VectorsConfig::Single(VectorParamsBuilder::new(4, Distance::Dot).build()),
             shard_number: NonZeroU32::new(4).unwrap(),
             replication_factor: NonZeroU32::new(3).unwrap(),
-            write_consistency_factor: NonZeroU32::new(2).unwrap(),
+            write_consistency_factor,
             ..CollectionParams::empty()
         };
 
@@ -938,13 +1410,12 @@ mod tests {
             Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
 
         let shared_config = Arc::new(RwLock::new(config.clone()));
-        let remotes = HashSet::from([2, 3, 4, 5]);
         ShardReplicaSet::build(
             1,
             None,
             "test_collection".to_string(),
-            1,
-            false,
+            this_peer_id,
+            local,
             remotes,
             dummy_on_replica_failure(),
             dummy_abort_shard_transfer(),
